@@ -2,7 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.4.0] - 2026-10-27
+
+Changes from 0.3.1 to 0.4.0.
 
 ### Added
 
@@ -10,14 +12,15 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
-- Separate AI intent grouping from commit-message generation, generating one group at a time with the selected model.
-- Check input budgets before requests; analyze oversized groups through complete diff fragments and model summaries.
+- Group staged changes by intent using bounded file summaries before generating commit messages one group at a time with the selected model.
+- Check input budgets before every request; split oversized groups into bounded diff fragments and combine model summaries so large changes can be analyzed with the same model, including DeepSeek.
 - Display completed candidates incrementally while keeping commit actions disabled during generation.
 
 ### Fixed
 
 - Avoid retrying all staged diffs after provider failures; use local grouping only when the AI grouping output is invalid.
 - Preserve staged files that have no candidate yet when committing results from a cancelled or partially failed generation.
+- Honor cancellation during token counting and response streaming, preventing further requests or candidate updates after cancellation.
 
 ## [0.3.1] - 2026-08-19
 
