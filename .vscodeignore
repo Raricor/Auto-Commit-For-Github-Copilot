@@ -1,5 +1,9 @@
 node_modules/
+.github/
 .vscode-test/
+.test-out/
+tests/
+docs/superpowers/
 src/
 *.vsix
 **/*.map

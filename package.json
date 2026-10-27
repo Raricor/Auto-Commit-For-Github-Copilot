@@ -73,7 +73,9 @@
         }
     },
     "scripts": {
+        "typecheck": "tsc -p ./ --noEmit && tsc -p tsconfig.webview.json",
         "test": "tsc -p tsconfig.test.json && node --test .test-out/tests/*.test.js",
+        "package": "npx --yes @vscode/vsce@4.0.0 package --no-dependencies --out autocommit-for-github-copilot.vsix",
         "vscode:prepublish": "npm run compile:prod",
         "compile": "tsc -p ./ && node esbuild.webview.mjs",
         "compile:prod": "tsc -p ./ && node esbuild.webview.mjs --production",
