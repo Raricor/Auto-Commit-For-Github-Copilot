@@ -1,6 +1,8 @@
 import * as vscode from 'vscode';
+import { groupFiles } from '../git/diffAnalyzer';
 import type { CommitCandidate, FileChange, FileGroup, GenerateOptions, GitLogEntry } from '../types';
-import { buildBatchPrompt, buildGroupingPrompt, buildPrompt } from './promptBuilder';
+import { buildGroupingPrompt, buildPrompt, buildSummaryPrompt, type EvidencePart } from './promptBuilder';
+import { fitsPrompt, inputBudget, InputBudgetError, prepareGroupingPrompt } from './promptBudget';
 
 let _modelCache: vscode.LanguageModelChat | undefined;
 let _cachedModelId: string | undefined;
@@ -64,121 +66,31 @@ export async function generateForGroup(
     token: vscode.CancellationToken,
     recentCommits?: GitLogEntry[]
 ): Promise<CommitCandidate> {
+    checkCancellation(token);
     const model = await getModel(options.model);
-    const prompt = buildPrompt(group, options, recentCommits);
-
-    const messages = [vscode.LanguageModelChatMessage.User(prompt)];
-    const response = await model.sendRequest(messages, {}, token);
-
-    let raw = '';
-    for await (const chunk of response.text) {
-        if (token.isCancellationRequested) {
-            throw new vscode.CancellationError();
-        }
-        raw += chunk;
-    }
-
-    const parsed = parseResponse(raw);
-
-    return {
-        id: generateId(),
-        message: parsed.message.trim(),
-        reason: parsed.reason.trim(),
-        files: group.files.map((f) => f.path),
-        checked: true,
-    };
+    return generateGroupWithModel(group, options, model, token, recentCommits);
 }
 
 /**
- * Sends ALL file groups in a single LLM request and returns one CommitCandidate per group.
- * More token-efficient than calling generateForGroup N times because the system instructions
- * are only sent once.
+ * Generate independently for each group. Never combine their full diffs in one request.
  */
 export async function generateForAllGroups(
     groups: FileGroup[],
     options: GenerateOptions,
     token: vscode.CancellationToken,
-    recentCommits?: GitLogEntry[]
+    recentCommits?: GitLogEntry[],
+    onCandidate?: (candidate: CommitCandidate) => void,
 ): Promise<CommitCandidate[]> {
     if (groups.length === 0) {
         return [];
     }
 
+    checkCancellation(token);
     const model = await getModel(options.model);
-    const prompt = buildBatchPrompt(groups, options, recentCommits);
-
-    const messages = [vscode.LanguageModelChatMessage.User(prompt)];
-    const response = await model.sendRequest(messages, {}, token);
-
-    let raw = '';
-    for await (const chunk of response.text) {
-        if (token.isCancellationRequested) {
-            throw new vscode.CancellationError();
-        }
-        raw += chunk;
-    }
-
-    const items = parseArrayResponse(raw, groups.length);
-
-    return groups.map((group, i) => ({
-        id: generateId(),
-        message: items[i].message.trim(),
-        reason: items[i].reason.trim(),
-        files: group.files.map((f) => f.path),
-        checked: true,
-    }));
+    return generateGroupsWithModel(groups, options, model, token, recentCommits, onCandidate);
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
-
-function parseArrayResponse(raw: string, expectedCount: number): Array<{ message: string; reason: string }> {
-    const cleaned = raw
-        .replace(/^```(?:json)?\s*/m, '')
-        .replace(/\s*```\s*$/m, '')
-        .trim();
-
-    const tryParseArray = (text: string) => {
-        const arr = JSON.parse(text) as unknown;
-        if (!Array.isArray(arr) || arr.length !== expectedCount) {
-            return null;
-        }
-        for (const item of arr) {
-            if (
-                !item ||
-                typeof item !== 'object' ||
-                typeof (item as Record<string, unknown>).message !== 'string' ||
-                typeof (item as Record<string, unknown>).reason !== 'string'
-            ) {
-                return null;
-            }
-        }
-        return arr as Array<{ message: string; reason: string }>;
-    };
-
-    try {
-        const result = tryParseArray(cleaned);
-        if (result) {
-            return result;
-        }
-    } catch {
-        // fall through
-    }
-
-    // Try to extract a JSON array from somewhere in the response
-    const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
-    if (arrayMatch) {
-        try {
-            const result = tryParseArray(arrayMatch[0]);
-            if (result) {
-                return result;
-            }
-        } catch {
-            // fall through
-        }
-    }
-
-    throw new Error(`Could not parse batch LLM response (expected array of ${expectedCount}): ${raw.slice(0, 300)}`);
-}
 
 function parseResponse(raw: string): { message: string; reason: string } {
     // Strip markdown code fences if the model added them anyway
@@ -232,54 +144,46 @@ function generateId(): string {
     return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
 }
 
-// ─── AI-driven grouping + generation (single LLM call) ───────────────────────
+// ─── AI-driven grouping, followed by per-group generation ────────────────────
 
 /**
- * Sends ALL staged changes to the LLM in a single request and lets the model
- * decide both HOW to group the files AND what commit message each group gets.
- *
- * Returns one CommitCandidate per AI-determined group. Every input file is
- * guaranteed to appear in exactly one returned candidate; if the model omits
- * or duplicates files, an Error is thrown so the caller can fall back to the
- * rule-based grouping path.
+ * First group bounded file evidence by intent, then generate for each group.
+ * Only invalid grouping output triggers local rules. Provider errors propagate.
  */
 export async function generateGroupedCommits(
     changes: FileChange[],
     options: GenerateOptions,
     token: vscode.CancellationToken,
-    recentCommits?: GitLogEntry[]
+    recentCommits?: GitLogEntry[],
+    onCandidate?: (candidate: CommitCandidate) => void,
 ): Promise<CommitCandidate[]> {
     if (changes.length === 0) {
         return [];
     }
 
+    checkCancellation(token);
     const model = await getModel(options.model);
-    const prompt = buildGroupingPrompt(changes, options, recentCommits);
-
-    const messages = [vscode.LanguageModelChatMessage.User(prompt)];
-    const response = await model.sendRequest(messages, {}, token);
-
-    let raw = '';
-    for await (const chunk of response.text) {
-        if (token.isCancellationRequested) {
-            throw new vscode.CancellationError();
-        }
-        raw += chunk;
+    const prompt = await prepareGroupingPrompt(
+        changes, evidence => buildGroupingPrompt(evidence, options), model, token,
+        () => checkCancellation(token),
+    );
+    const raw = await sendPrompt(model, prompt, token);
+    let groups: FileGroup[];
+    try {
+        const validated = validateGrouping(parseGroupingResponse(raw), changes);
+        const byPath = new Map(changes.map(file => [file.path, file]));
+        groups = validated.map(group => ({
+            groupType: 'misc', label: group.label,
+            files: group.files.map(path => byPath.get(path)!),
+        }));
+    } catch {
+        console.warn('[AutoCommit] Invalid AI grouping output; using local grouping rules.');
+        groups = groupFiles(changes);
     }
-
-    const items = parseGroupingResponse(raw);
-    const validated = validateGrouping(items, changes);
-
-    return validated.map((g) => ({
-        id: generateId(),
-        message: g.message.trim(),
-        reason: g.reason.trim(),
-        files: g.files,
-        checked: true,
-    }));
+    return generateGroupsWithModel(groups, options, model, token, recentCommits, onCandidate);
 }
 
-interface ParsedGroup { message: string; reason: string; files: string[]; }
+interface ParsedGroup { label: string; files: string[]; }
 
 function parseGroupingResponse(raw: string): ParsedGroup[] {
     const cleaned = raw
@@ -297,8 +201,8 @@ function parseGroupingResponse(raw: string): ParsedGroup[] {
             if (!item || typeof item !== 'object') { return null; }
             const rec = item as Record<string, unknown>;
             if (
-                typeof rec.message !== 'string' ||
-                typeof rec.reason !== 'string' ||
+                typeof rec.label !== 'string' ||
+                rec.label.trim().length === 0 ||
                 !Array.isArray(rec.files) ||
                 rec.files.length === 0 ||
                 !rec.files.every((f) => typeof f === 'string')
@@ -306,8 +210,7 @@ function parseGroupingResponse(raw: string): ParsedGroup[] {
                 return null;
             }
             out.push({
-                message: rec.message,
-                reason: rec.reason,
+                label: rec.label.trim(),
                 files: rec.files as string[],
             });
         }
@@ -366,3 +269,106 @@ function validateGrouping(groups: ParsedGroup[], changes: FileChange[]): ParsedG
 
 // Re-export for callers that still need the rule-based FileGroup shape.
 export type { FileGroup };
+
+function checkCancellation(token: vscode.CancellationToken): void {
+    if (token.isCancellationRequested) { throw new vscode.CancellationError(); }
+}
+
+/** Caller has already fitted and counted this prompt. */
+async function sendPrompt(model: vscode.LanguageModelChat, prompt: string, token: vscode.CancellationToken): Promise<string> {
+    checkCancellation(token);
+    const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)], {}, token);
+    checkCancellation(token);
+    let raw = '';
+    for await (const chunk of response.text) {
+        checkCancellation(token);
+        raw += chunk;
+    }
+    checkCancellation(token);
+    return raw;
+}
+
+async function generateGroupsWithModel(
+    groups: FileGroup[], options: GenerateOptions, model: vscode.LanguageModelChat,
+    token: vscode.CancellationToken, history?: GitLogEntry[],
+    onCandidate?: (candidate: CommitCandidate) => void,
+): Promise<CommitCandidate[]> {
+    const candidates: CommitCandidate[] = [];
+    for (const group of groups) {
+        checkCancellation(token);
+        const candidate = await generateGroupWithModel(group, options, model, token, history);
+        checkCancellation(token);
+        candidates.push(candidate);
+        onCandidate?.(candidate);
+    }
+    checkCancellation(token);
+    return candidates;
+}
+
+async function generateGroupWithModel(
+    group: FileGroup, options: GenerateOptions, model: vscode.LanguageModelChat,
+    token: vscode.CancellationToken, history?: GitLogEntry[],
+): Promise<CommitCandidate> {
+    const budget = inputBudget(model);
+    const fits = (prompt: string) => fitsPrompt(prompt, model, budget, token, () => checkCancellation(token));
+    let prompt = buildPrompt(group, options, history);
+    if (!await fits(prompt)) {
+        // Check irreducible instructions and file manifest before spending calls
+        // summarizing diffs. These must fit even with no evidence attached.
+        if (!await fits(buildPrompt(group, options, history, ''))) { throw new InputBudgetError(); }
+        const parts = group.files.map(file => ({ path: file.path, type: file.type, offset: 0, text: file.diff }));
+        let evidence = (await summarizeParts(parts, 'diffs', group.label, model, token, budget)).join('\n\n');
+        prompt = buildPrompt(group, options, history, evidence);
+        let rounds = 0;
+        while (!await fits(prompt)) {
+            if (rounds++ >= 3) { throw new InputBudgetError(); }
+            const reduced = (await summarizeParts([{ text: evidence }], 'summaries', group.label, model, token, budget)).join('\n\n');
+            if (reduced.length >= evidence.length) {
+                throw new Error('The model did not shorten its summaries enough. Stage fewer files and generate again.');
+            }
+            evidence = reduced;
+            prompt = buildPrompt(group, options, history, evidence);
+        }
+    }
+    const parsed = parseResponse(await sendPrompt(model, prompt, token));
+    if (!parsed.message.trim() || !parsed.reason.trim()) {
+        throw new Error('The model returned an empty commit message or reason. Generate again.');
+    }
+    return {
+        id: generateId(), message: parsed.message.trim(), reason: parsed.reason.trim(),
+        files: group.files.map(file => file.path), checked: true,
+    };
+}
+
+/** Split requests, never discard input. Even a single oversized file can be analyzed. */
+async function summarizeParts(
+    parts: EvidencePart[], source: 'diffs' | 'summaries', label: string,
+    model: vscode.LanguageModelChat, token: vscode.CancellationToken, budget: number,
+): Promise<string[]> {
+    checkCancellation(token);
+    const prompt = buildSummaryPrompt(label, parts, source);
+    if (await fitsPrompt(prompt, model, budget, token, () => checkCancellation(token))) {
+        const summary = (await sendPrompt(model, prompt, token)).trim();
+        if (!summary) { throw new Error('The model returned an empty diff summary. Generate again.'); }
+        return [summary];
+    }
+    let left: EvidencePart[];
+    let right: EvidencePart[];
+    if (parts.length > 1) {
+        const mid = Math.floor(parts.length / 2);
+        left = parts.slice(0, mid);
+        right = parts.slice(mid);
+    } else {
+        const part = parts[0];
+        if (!part || part.text.length <= 1) { throw new InputBudgetError(); }
+        let mid = Math.floor(part.text.length / 2);
+        // Keep UTF-16 surrogate pairs intact across requests.
+        if (/[\uD800-\uDBFF]/.test(part.text[mid - 1]) && /[\uDC00-\uDFFF]/.test(part.text[mid])) { mid--; }
+        if (mid === 0) { throw new InputBudgetError(); }
+        left = [{ ...part, text: part.text.slice(0, mid) }];
+        right = [{ ...part, offset: (part.offset ?? 0) + mid, text: part.text.slice(mid) }];
+    }
+    const first = await summarizeParts(left, source, label, model, token, budget);
+    const second = await summarizeParts(right, source, label, model, token, budget);
+    return [...first, ...second];
+}
