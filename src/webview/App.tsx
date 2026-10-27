@@ -165,7 +165,7 @@ export default function App() {
     }, [state.settings, state.prompt, state.committing]);
 
     const handleCommit = useCallback(() => {
-        if (state.committing) {
+        if (state.committing || state.generating) {
             return;
         }
         const ids = state.candidates.filter((c) => c.checked).map((c) => c.id);
@@ -173,15 +173,15 @@ export default function App() {
             dispatch({ type: 'SET_COMMITTING', committing: true });
             postMessage({ type: 'commit', ids, orderedCandidates: state.candidates });
         }
-    }, [state.candidates, state.committing]);
+    }, [state.candidates, state.committing, state.generating]);
 
     const handleCommitOne = useCallback((id: string) => {
-        if (state.committing || !state.candidates.some((c) => c.id === id)) {
+        if (state.committing || state.generating || !state.candidates.some((c) => c.id === id)) {
             return;
         }
         dispatch({ type: 'SET_COMMITTING', committing: true });
         postMessage({ type: 'commit', ids: [id], orderedCandidates: state.candidates });
-    }, [state.candidates, state.committing]);
+    }, [state.candidates, state.committing, state.generating]);
 
     const handleOpenFile = useCallback((path: string) => {
         postMessage({ type: 'openFile', path });
@@ -275,10 +275,10 @@ export default function App() {
                     {state.success && <div className="success-banner">{state.success}</div>}
 
                     {/* Generating spinner */}
-                    {state.generating && state.candidates.length === 0 && (
+                    {state.generating && (
                         <div className="loading-wrap">
                             <div className="spinner" />
-                            <span>Generating commit messages...</span>
+                            <span>Grouping changes and generating commits...</span>
                         </div>
                     )}
 
@@ -311,11 +311,11 @@ export default function App() {
                                         onReorder={handleReorderCandidates}
                                         onUpdateMessage={handleUpdateMessage}
                                         onCommitOne={handleCommitOne}
-                                        committing={state.committing}
+                                        commitDisabled={state.committing || state.generating}
                                     />
                                     <button
                                         className="btn-commit-all"
-                                        disabled={checkedCount === 0 || state.committing}
+                                        disabled={checkedCount === 0 || state.committing || state.generating}
                                         onClick={handleCommit}
                                     >
                                         <Check size={16} />

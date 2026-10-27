@@ -1,9 +1,9 @@
 import * as vscode from 'vscode';
 import { getSettings, updateSettings } from '../config/settings';
-import { groupFiles, parseDiff, resolveStagingPaths } from '../git/diffAnalyzer';
+import { parseDiff, resolveStagingPaths } from '../git/diffAnalyzer';
 import { GitIdentityError } from '../git/gitIdentity';
 import { GitService } from '../git/gitService';
-import { generateForAllGroups, generateGroupedCommits, getAvailableModels } from '../llm/llmService';
+import { generateGroupedCommits, getAvailableModels } from '../llm/llmService';
 import type {
     CommitCandidate,
     ExtensionMessage,
@@ -29,6 +29,7 @@ export class PanelManager {
     private recentCommits: GitLogEntry[] = [];
     private availableModels: ModelInfo[] | undefined;
     private generationRunId = 0;
+    private generating = false;
 
     private constructor(private readonly context: vscode.ExtensionContext) { }
 
@@ -185,6 +186,7 @@ export class PanelManager {
             case 'cancel': {
                 this.generationRunId += 1;
                 this.cancellation?.cancel();
+                this.generating = false;
                 this.post({ type: 'done' });
                 break;
             }
@@ -273,6 +275,7 @@ export class PanelManager {
         const runId = ++this.generationRunId;
         const isActiveRun = () => runId === this.generationRunId && !token.isCancellationRequested;
 
+        this.generating = true;
         this.candidates = [];
         this.post({ type: 'loading' });
 
@@ -335,43 +338,11 @@ export class PanelManager {
             }
 
             try {
-                // Primary path: let the LLM decide how to group the files
-                // (semantic / intent-based) AND produce one commit per group
-                // in a single call.
-                let candidates: CommitCandidate[];
-                try {
-                    candidates = await generateGroupedCommits(
-                        changes,
-                        settings,
-                        token,
-                        this.recentCommits
-                    );
-                } catch (groupingErr) {
-                    if (token.isCancellationRequested || groupingErr instanceof vscode.CancellationError) {
-                        throw groupingErr;
-                    }
-                    // Fall back to the deterministic rule-based grouping if the
-                    // model returns malformed/incomplete output.
-                    console.warn('[AutoCommit] AI grouping failed, falling back to rule-based grouping:', groupingErr);
-                    const groups = groupFiles(changes);
-                    if (groups.length === 0) {
-                        if (isActiveRun()) {
-                            this.post({ type: 'error', message: 'Could not analyse the staged changes.' });
-                        }
-                        return;
-                    }
-                    candidates = await generateForAllGroups(groups, settings, token, this.recentCommits);
-                }
-
-                if (!isActiveRun()) { return; }
-                for (const candidate of candidates) {
-                    if (token.isCancellationRequested) {
-                        break;
-                    }
-                    if (!isActiveRun()) { break; }
+                await generateGroupedCommits(changes, settings, token, this.recentCommits, candidate => {
+                    if (!isActiveRun()) { return; }
                     this.candidates.push(candidate);
                     this.post({ type: 'addCandidate', candidate });
-                }
+                });
             } catch (err) {
                 if (isActiveRun() && !(token.isCancellationRequested || err instanceof vscode.CancellationError)) {
                     this.post({ type: 'error', message: `Generation failed: ${String(err)}` });
@@ -381,16 +352,18 @@ export class PanelManager {
             if (isActiveRun()) {
                 this.post({ type: 'error', message: `Generation failed: ${String(err)}` });
             }
-        }
-
-        if (isActiveRun()) {
-            this.post({ type: 'done' });
+        } finally {
+            if (runId === this.generationRunId) {
+                this.generating = false;
+                if (!token.isCancellationRequested) { this.post({ type: 'done' }); }
+            }
         }
     }
 
     // ─── Commit execution ───────────────────────────────────────────────────────
 
     private async commitSelected(ids: string[], orderedCandidates?: CommitCandidate[]): Promise<void> {
+        if (this.generating) { return; }
         // Use ordered candidates from webview if provided (user may have reordered/edited)
         const allCandidates = orderedCandidates ?? this.candidates;
         const selected = allCandidates.filter((c) => ids.includes(c.id));
@@ -399,9 +372,10 @@ export class PanelManager {
         }
 
         const committedIds = selected.map((c) => c.id);
-        const unchecked = allCandidates.filter((c) => !committedIds.includes(c.id));
+        const selectedPaths = new Set(selected.flatMap(candidate => candidate.files));
         const uncheckedFiles = resolveStagingPaths(
-            unchecked.flatMap((c) => c.files),
+            // After cancellation/failure some staged files may not have a candidate yet.
+            this.fileChanges.filter(file => !selectedPaths.has(file.path)).map(file => file.path),
             this.fileChanges
         );
 
