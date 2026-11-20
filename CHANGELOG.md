@@ -2,7 +2,9 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [1.0.0] - 2026-11-20
+
+Changes from 0.4.0 to 1.0.0. First stable release.
 
 ### Added
 

@@ -42,7 +42,7 @@ building it yourself from source.
    Alternatively, from a terminal:
 
    ```bash
-   code --install-extension autocommit-for-github-copilot-0.2.0.vsix
+   code --install-extension autocommit-for-github-copilot-1.0.0.vsix
    ```
 
 ### Option B — Build from source
