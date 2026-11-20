@@ -68,6 +68,50 @@
                     "type": "string",
                     "default": "",
                     "description": "Preferred GitHub Copilot language model. Empty means Auto."
+                },
+                "autocommit-for-github-copilot.minCommits": {
+                    "type": "number",
+                    "default": 0,
+                    "minimum": 0,
+                    "maximum": 200,
+                    "description": "Fewest commits to generate. 0 means no limit."
+                },
+                "autocommit-for-github-copilot.maxCommits": {
+                    "type": "number",
+                    "default": 0,
+                    "minimum": 0,
+                    "maximum": 200,
+                    "description": "Most commits to generate. 0 means no limit."
+                },
+                "autocommit-for-github-copilot.reasoningEffort": {
+                    "type": "string",
+                    "default": "",
+                    "enum": [
+                        "",
+                        "none",
+                        "low",
+                        "medium",
+                        "high",
+                        "xhigh",
+                        "max"
+                    ],
+                    "enumDescriptions": [
+                        "Use the effort configured for the model in VS Code",
+                        "Do not spend effort on thinking",
+                        "Use a small amount of thinking",
+                        "Use a moderate amount of thinking",
+                        "Use a large amount of thinking",
+                        "Use an extra-large amount of thinking",
+                        "Use the maximum available thinking"
+                    ],
+                    "description": "Thinking effort sent with each request. Empty uses the effort configured for the model in VS Code. Models ignore levels they do not support."
+                },
+                "autocommit-for-github-copilot.concurrency": {
+                    "type": "number",
+                    "default": 4,
+                    "minimum": 1,
+                    "maximum": 8,
+                    "description": "Most model requests in flight at once."
                 }
             }
         }
@@ -88,6 +132,7 @@
         "@types/react": "^19.2.14",
         "@types/react-dom": "^19.2.3",
         "@types/vscode": "^1.90.0",
+        "@vscode/codicons": "^0.0.46-24",
         "esbuild": "^0.28.0",
         "react": "^19.2.5",
         "react-dom": "^19.2.5",

@@ -1,6 +1,6 @@
 import { ChevronDown, ChevronRight, Settings } from 'lucide-react';
-import { useState } from 'react';
-import type { GenerateOptions } from '../../types';
+import { useEffect, useState } from 'react';
+import type { GenerateOptions, ReasoningEffort } from '../../types';
 
 interface Props {
     settings: GenerateOptions;
@@ -10,8 +10,67 @@ interface Props {
     onPromptChange: (prompt: string) => void;
 }
 
+type CommitCountKey = 'minCommits' | 'maxCommits';
+
+const MAX_COMMITS = 200;
+
+const EFFORT_OPTIONS: Array<{ value: ReasoningEffort | ''; label: string }> = [
+    { value: '', label: 'Model default' },
+    { value: 'none', label: 'None' },
+    { value: 'low', label: 'Low' },
+    { value: 'medium', label: 'Medium' },
+    { value: 'high', label: 'High' },
+    { value: 'xhigh', label: 'Extra high' },
+    { value: 'max', label: 'Max' },
+];
+
+function toCountText(value: number | undefined): string {
+    return value && value > 0 ? String(value) : '';
+}
+
+function toCount(text: string): number {
+    if (text === '') return 0;
+    const parsed = Number.parseInt(text, 10);
+    if (!Number.isFinite(parsed)) return 0;
+    return Math.max(0, Math.min(MAX_COMMITS, parsed));
+}
+
+function normalizeCountInput(raw: string): string {
+    const digits = raw.replace(/[^\d]/g, '');
+    if (digits === '') return '';
+    const value = Math.min(MAX_COMMITS, Number.parseInt(digits, 10));
+    return value === 0 ? '' : String(value);
+}
+
 export default function SettingsPanel({ settings, models, prompt, onUpdate, onPromptChange }: Props) {
     const [expanded, setExpanded] = useState(true);
+    const [minText, setMinText] = useState(toCountText(settings.minCommits));
+    const [maxText, setMaxText] = useState(toCountText(settings.maxCommits));
+    const [rangeError, setRangeError] = useState(false);
+
+    useEffect(() => {
+        setMinText(toCountText(settings.minCommits));
+    }, [settings.minCommits]);
+
+    useEffect(() => {
+        setMaxText(toCountText(settings.maxCommits));
+    }, [settings.maxCommits]);
+
+    const handleCountChange = (key: CommitCountKey, raw: string) => {
+        const text = normalizeCountInput(raw);
+        if (key === 'minCommits') setMinText(text);
+        else setMaxText(text);
+
+        const nextMin = key === 'minCommits' ? toCount(text) : toCount(minText);
+        const nextMax = key === 'maxCommits' ? toCount(text) : toCount(maxText);
+        const invalid = nextMin > 0 && nextMax > 0 && nextMin > nextMax;
+        setRangeError(invalid);
+        if (invalid) return;
+
+        // Send both so a value that was previously blocked by validation is synced too.
+        if (nextMin !== (settings.minCommits ?? 0)) onUpdate('minCommits', nextMin);
+        if (nextMax !== (settings.maxCommits ?? 0)) onUpdate('maxCommits', nextMax);
+    };
 
     return (
         <div className="panel-card">
@@ -53,6 +112,55 @@ export default function SettingsPanel({ settings, models, prompt, onUpdate, onPr
                                 <option value="auto">Auto</option>
                             </select>
                         </div>
+                    </div>
+
+                    <div className="config-grid">
+                        <div className="config-field">
+                            <span className="config-label">Min commits</span>
+                            <input
+                                type="number"
+                                className="config-input"
+                                min={0}
+                                max={MAX_COMMITS}
+                                step={1}
+                                value={minText}
+                                placeholder="No limit"
+                                onChange={(e) => handleCountChange('minCommits', e.target.value)}
+                            />
+                        </div>
+                        <div className="config-field">
+                            <span className="config-label">Max commits</span>
+                            <input
+                                type="number"
+                                className="config-input"
+                                min={0}
+                                max={MAX_COMMITS}
+                                step={1}
+                                value={maxText}
+                                placeholder="No limit"
+                                onChange={(e) => handleCountChange('maxCommits', e.target.value)}
+                            />
+                        </div>
+                    </div>
+
+                    {rangeError && (
+                        <div className="config-error-text" role="alert">Min cannot exceed Max</div>
+                    )}
+
+                    <div className="config-field config-field-wide">
+                        <span className="config-label">Thinking effort</span>
+                        <select
+                            className="config-select"
+                            value={settings.reasoningEffort ?? ''}
+                            onChange={(e) => onUpdate('reasoningEffort', e.target.value)}
+                        >
+                            {EFFORT_OPTIONS.map((option) => (
+                                <option key={option.value} value={option.value}>{option.label}</option>
+                            ))}
+                        </select>
+                        <span className="config-hint">
+                            Applies to every request. Models ignore levels they do not support.
+                        </span>
                     </div>
 
                     <label className="config-checkbox-row">
