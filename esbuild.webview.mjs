@@ -12,6 +12,11 @@ await esbuild.build({
     minify: production,
     sourcemap: !production,
     jsx: 'automatic',
+    loader: {
+        '.woff': 'file',
+        '.ttf': 'file',
+    },
+    assetNames: 'assets/[name]-[hash]',
     define: {
         'process.env.NODE_ENV': production ? '"production"' : '"development"',
     },

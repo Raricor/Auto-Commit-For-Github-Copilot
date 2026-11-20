@@ -5,5 +5,7 @@ node_modules/
 tests/
 docs/superpowers/
 src/
+media/
+scripts/
 *.vsix
 **/*.map
