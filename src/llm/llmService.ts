@@ -1,8 +1,17 @@
 import * as vscode from 'vscode';
-import { groupFiles } from '../git/diffAnalyzer';
-import type { CommitCandidate, FileChange, FileGroup, GenerateOptions, GitLogEntry } from '../types';
-import { buildGroupingPrompt, buildPrompt, buildSummaryPrompt, type EvidencePart } from './promptBuilder';
-import { fitsPrompt, inputBudget, InputBudgetError, prepareGroupingPrompt } from './promptBudget';
+import type {
+    CommitCandidate, FileChange, GenerateOptions, GenerationProgress,
+    GitLogEntry, NoticeLevel, PlannedGroup,
+} from '../types';
+import { checkCancellation, createLinkedToken } from './cancellation';
+import { createLimiter } from './concurrency';
+import {
+    CONFIRM_REQUEST_THRESHOLD, estimateRequests, generateGroupCandidate,
+    type RequestEstimate,
+} from './generation';
+import { planGroups } from './grouping';
+import { createModelClient, isProviderError } from './modelClient';
+import { orderCandidates } from './ordering';
 
 let _modelCache: vscode.LanguageModelChat | undefined;
 let _cachedModelId: string | undefined;
@@ -56,319 +65,234 @@ export function clearModelCache(): void {
     _cachedModelId = undefined;
 }
 
-/**
- * Calls the Copilot LM API for a single FileGroup and returns a CommitCandidate.
- * Throws if the model is unavailable or the response cannot be parsed.
- */
-export async function generateForGroup(
-    group: FileGroup,
-    options: GenerateOptions,
-    token: vscode.CancellationToken,
-    recentCommits?: GitLogEntry[]
-): Promise<CommitCandidate> {
-    checkCancellation(token);
-    const model = await getModel(options.model);
-    return generateGroupWithModel(group, options, model, token, recentCommits);
+export type { RequestEstimate };
+
+export interface GenerationEvents {
+    onProgress?(progress: GenerationProgress): void;
+    /** Emitted once, after grouping is final and the user accepted the estimate. */
+    onGroupsPlanned?(groups: PlannedGroup[]): void;
+    onCandidate?(groupIndex: number, candidate: CommitCandidate): void;
+    onGroupFailed?(group: PlannedGroup, error: Error): void;
+    onNotice?(level: NoticeLevel, message: string): void;
+    /** AI commit order: candidate ids, first commit first. */
+    onReorder?(ids: string[]): void;
+    /** Asked when the estimate exceeds CONFIRM_REQUEST_THRESHOLD. Resolve false to stop. */
+    confirmRequests?(estimate: RequestEstimate): Promise<boolean>;
 }
 
-/**
- * Generate independently for each group. Never combine their full diffs in one request.
- */
-export async function generateForAllGroups(
-    groups: FileGroup[],
-    options: GenerateOptions,
-    token: vscode.CancellationToken,
-    recentCommits?: GitLogEntry[],
-    onCandidate?: (candidate: CommitCandidate) => void,
-): Promise<CommitCandidate[]> {
-    if (groups.length === 0) {
-        return [];
-    }
-
-    checkCancellation(token);
-    const model = await getModel(options.model);
-    return generateGroupsWithModel(groups, options, model, token, recentCommits, onCandidate);
+export interface GenerationResult {
+    groups: PlannedGroup[];
+    /** Successful candidates in group order. */
+    candidates: Array<{ groupIndex: number; candidate: CommitCandidate }>;
+    failed: Array<{ group: PlannedGroup; error: Error }>;
+    /** Candidate ids in commit order, when ordering ran. */
+    order?: string[];
+    /** Set when the user declined the request estimate; nothing was generated. */
+    declined?: boolean;
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+export { CONFIRM_REQUEST_THRESHOLD };
 
-function parseResponse(raw: string): { message: string; reason: string } {
-    // Strip markdown code fences if the model added them anyway
-    const cleaned = raw
-        .replace(/^```(?:json)?\s*/m, '')
-        .replace(/\s*```\s*$/m, '')
-        .trim();
-
-    const tryParse = (text: string) => {
-        const obj = JSON.parse(text) as unknown;
-        if (
-            obj &&
-            typeof obj === 'object' &&
-            'message' in obj &&
-            'reason' in obj &&
-            typeof (obj as Record<string, unknown>).message === 'string' &&
-            typeof (obj as Record<string, unknown>).reason === 'string'
-        ) {
-            return obj as { message: string; reason: string };
-        }
-        return null;
-    };
-
-    // Direct parse
-    try {
-        const result = tryParse(cleaned);
-        if (result) {
-            return result;
-        }
-    } catch {
-        // fall through
-    }
-
-    // Try to extract a JSON object from somewhere in the response
-    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-        try {
-            const result = tryParse(jsonMatch[0]);
-            if (result) {
-                return result;
-            }
-        } catch {
-            // fall through
-        }
-    }
-
-    throw new Error(`Could not parse LLM response: ${raw.slice(0, 300)}`);
-}
-
-function generateId(): string {
-    return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-}
-
-// ─── AI-driven grouping, followed by per-group generation ────────────────────
+// Exposed for the later ordering phase, which adds its own requests.
+export { estimateRequests };
 
 /**
- * First group bounded file evidence by intent, then generate for each group.
- * Only invalid grouping output triggers local rules. Provider errors propagate.
+ * Groups staged changes, optionally confirms the request estimate, then
+ * generates every group concurrently. Provider failures abort all in-flight
+ * work; output/budget failures stay local to their group.
  */
-export async function generateGroupedCommits(
+export async function generateCommits(
     changes: FileChange[],
     options: GenerateOptions,
     token: vscode.CancellationToken,
-    recentCommits?: GitLogEntry[],
-    onCandidate?: (candidate: CommitCandidate) => void,
-): Promise<CommitCandidate[]> {
+    history?: GitLogEntry[],
+    events?: GenerationEvents,
+): Promise<GenerationResult> {
     if (changes.length === 0) {
-        return [];
+        return { groups: [], candidates: [], failed: [] };
     }
 
-    checkCancellation(token);
-    const model = await getModel(options.model);
-    const prompt = await prepareGroupingPrompt(
-        changes, evidence => buildGroupingPrompt(evidence, options), model, token,
-        () => checkCancellation(token),
-    );
-    const raw = await sendPrompt(model, prompt, token);
-    let groups: FileGroup[];
+    const abort = createLinkedToken(token);
+    const limiter = createLimiter(clampConcurrency(options.concurrency));
+
     try {
-        const validated = validateGrouping(parseGroupingResponse(raw), changes);
-        const byPath = new Map(changes.map(file => [file.path, file]));
-        groups = validated.map(group => ({
-            groupType: 'misc', label: group.label,
-            files: group.files.map(path => byPath.get(path)!),
-        }));
-    } catch {
-        console.warn('[AutoCommit] Invalid AI grouping output; using local grouping rules.');
-        groups = groupFiles(changes);
-    }
-    return generateGroupsWithModel(groups, options, model, token, recentCommits, onCandidate);
-}
+        checkCancellation(token);
+        const model = await getModel(options.model);
+        checkCancellation(token);
+        // Set synchronously by the client as soon as a provider round-trip
+        // fails, before queued requests can take a freed limiter slot.
+        let providerError: Error | undefined;
+        const client = createModelClient(model, options, abort.token, limiter, undefined, error => {
+            if (token.isCancellationRequested || providerError) { return; }
+            providerError = toError(error);
+            abort.abort();
+        });
 
-interface ParsedGroup { label: string; files: string[]; }
-
-function parseGroupingResponse(raw: string): ParsedGroup[] {
-    const cleaned = raw
-        .replace(/^```(?:json)?\s*/m, '')
-        .replace(/\s*```\s*$/m, '')
-        .trim();
-
-    const tryParse = (text: string): ParsedGroup[] | null => {
-        const arr = JSON.parse(text) as unknown;
-        if (!Array.isArray(arr) || arr.length === 0) {
-            return null;
-        }
-        const out: ParsedGroup[] = [];
-        for (const item of arr) {
-            if (!item || typeof item !== 'object') { return null; }
-            const rec = item as Record<string, unknown>;
-            if (
-                typeof rec.label !== 'string' ||
-                rec.label.trim().length === 0 ||
-                !Array.isArray(rec.files) ||
-                rec.files.length === 0 ||
-                !rec.files.every((f) => typeof f === 'string')
-            ) {
-                return null;
+        let groups: PlannedGroup[];
+        try {
+            const planned = await planGroups({
+                changes,
+                options,
+                client,
+                token: abort.token,
+                confirmRequests: events?.confirmRequests,
+                events: {
+                    onProgress: progress => {
+                        if (!token.isCancellationRequested) { events?.onProgress?.(progress); }
+                    },
+                    onNotice: (level, message) => {
+                        if (!token.isCancellationRequested) { events?.onNotice?.(level, message); }
+                    },
+                },
+            });
+            if (planned.declined) {
+                return { groups: [], candidates: [], failed: [], declined: true };
             }
-            out.push({
-                label: rec.label.trim(),
-                files: rec.files as string[],
+            groups = planned.groups;
+        } catch (error) {
+            if (token.isCancellationRequested) { throw new vscode.CancellationError(); }
+            throw error;
+        }
+        checkCancellation(token);
+
+        const estimate = estimateRequests(groups, changes, client.budget, 'generation');
+        if (estimate.requests > CONFIRM_REQUEST_THRESHOLD && events?.confirmRequests) {
+            const accepted = await events.confirmRequests(estimate);
+            checkCancellation(token);
+            if (!accepted) {
+                return { groups: [], candidates: [], failed: [], declined: true };
+            }
+        }
+
+        if (!token.isCancellationRequested) { events?.onGroupsPlanned?.(groups); }
+
+        const candidates: Array<{ groupIndex: number; candidate: CommitCandidate }> = [];
+        const failed: Array<{ group: PlannedGroup; error: Error }> = [];
+        let done = 0;
+        const total = groups.length;
+
+        const recordFailure = (group: PlannedGroup, error: Error): void => {
+            failed.push({ group, error });
+            if (!token.isCancellationRequested) { events?.onGroupFailed?.(group, error); }
+        };
+        const recordDone = (): void => {
+            done += 1;
+            if (!token.isCancellationRequested) {
+                events?.onProgress?.({ stage: 'generating', done, total });
+            }
+        };
+
+        const tasks = groups.map(group => (async (): Promise<void> => {
+            try {
+                if (providerError) {
+                    recordFailure(group, providerError);
+                    return;
+                }
+                checkCancellation(abort.token);
+                const candidate = await generateGroupCandidate({
+                    group,
+                    changes,
+                    options,
+                    history,
+                    client,
+                    token: abort.token,
+                });
+                checkCancellation(token);
+                candidates.push({ groupIndex: group.index, candidate });
+                if (!token.isCancellationRequested) {
+                    events?.onCandidate?.(group.index, candidate);
+                }
+            } catch (error) {
+                if (token.isCancellationRequested) {
+                    throw new vscode.CancellationError();
+                }
+                if (providerError) {
+                    recordFailure(group, providerError);
+                    return;
+                }
+                const failure = toError(error);
+                if (isProviderError(failure) && !(failure instanceof vscode.CancellationError)) {
+                    // Abort every other in-flight request, then report this
+                    // original error to all groups that could not finish.
+                    providerError = failure;
+                    abort.abort();
+                    recordFailure(group, failure);
+                    return;
+                }
+                if (failure instanceof vscode.CancellationError) {
+                    // Without a provider error this is a user cancellation.
+                    throw failure;
+                }
+                recordFailure(group, failure);
+            } finally {
+                recordDone();
+            }
+        })());
+
+        await Promise.all(tasks);
+        if (providerError) { throw providerError; }
+
+        candidates.sort((a, b) => a.groupIndex - b.groupIndex);
+        failed.sort((a, b) => a.group.index - b.group.index);
+
+        let order: string[] | undefined;
+        if (candidates.length >= 2) {
+            checkCancellation(token);
+            order = await orderCandidates({
+                entries: candidates,
+                client,
+                token,
+                events: {
+                    onProgress: progress => {
+                        if (!token.isCancellationRequested) { events?.onProgress?.(progress); }
+                    },
+                    onNotice: (level, message) => {
+                        if (!token.isCancellationRequested) { events?.onNotice?.(level, message); }
+                    },
+                    onReorder: ids => {
+                        if (!token.isCancellationRequested) { events?.onReorder?.(ids); }
+                    },
+                },
             });
         }
-        return out;
-    };
 
-    try {
-        const result = tryParse(cleaned);
-        if (result) { return result; }
-    } catch { /* fall through */ }
-
-    const arrayMatch = cleaned.match(/\[[\s\S]*\]/);
-    if (arrayMatch) {
-        try {
-            const result = tryParse(arrayMatch[0]);
-            if (result) { return result; }
-        } catch { /* fall through */ }
+        return order
+            ? { groups, candidates, failed, order }
+            : { groups, candidates, failed };
+    } finally {
+        abort.dispose();
     }
-
-    throw new Error(`Could not parse grouping LLM response: ${raw.slice(0, 300)}`);
 }
 
-/**
- * Ensures every input file is referenced exactly once across all groups.
- * Returns the groups with file paths normalised to the original input casing/order.
- */
-function validateGrouping(groups: ParsedGroup[], changes: FileChange[]): ParsedGroup[] {
-    const validPaths = new Set(changes.map((c) => c.path));
-    const seen = new Set<string>();
-
-    for (const g of groups) {
-        const normalised: string[] = [];
-        for (const f of g.files) {
-            if (!validPaths.has(f)) {
-                throw new Error(`LLM returned unknown file path in group: ${f}`);
-            }
-            if (seen.has(f)) {
-                throw new Error(`LLM assigned the same file to multiple groups: ${f}`);
-            }
-            seen.add(f);
-            normalised.push(f);
-        }
-        g.files = normalised;
-    }
-
-    if (seen.size !== validPaths.size) {
-        const missing: string[] = [];
-        for (const p of validPaths) {
-            if (!seen.has(p)) { missing.push(p); }
-        }
-        throw new Error(`LLM did not assign every file to a group. Missing: ${missing.join(', ')}`);
-    }
-
-    return groups;
-}
-
-// Re-export for callers that still need the rule-based FileGroup shape.
-export type { FileGroup };
-
-function checkCancellation(token: vscode.CancellationToken): void {
-    if (token.isCancellationRequested) { throw new vscode.CancellationError(); }
-}
-
-/** Caller has already fitted and counted this prompt. */
-async function sendPrompt(model: vscode.LanguageModelChat, prompt: string, token: vscode.CancellationToken): Promise<string> {
-    checkCancellation(token);
-    const response = await model.sendRequest([vscode.LanguageModelChatMessage.User(prompt)], {}, token);
-    checkCancellation(token);
-    let raw = '';
-    for await (const chunk of response.text) {
-        checkCancellation(token);
-        raw += chunk;
-    }
-    checkCancellation(token);
-    return raw;
-}
-
-async function generateGroupsWithModel(
-    groups: FileGroup[], options: GenerateOptions, model: vscode.LanguageModelChat,
-    token: vscode.CancellationToken, history?: GitLogEntry[],
-    onCandidate?: (candidate: CommitCandidate) => void,
-): Promise<CommitCandidate[]> {
-    const candidates: CommitCandidate[] = [];
-    for (const group of groups) {
-        checkCancellation(token);
-        const candidate = await generateGroupWithModel(group, options, model, token, history);
-        checkCancellation(token);
-        candidates.push(candidate);
-        onCandidate?.(candidate);
-    }
-    checkCancellation(token);
-    return candidates;
-}
-
-async function generateGroupWithModel(
-    group: FileGroup, options: GenerateOptions, model: vscode.LanguageModelChat,
-    token: vscode.CancellationToken, history?: GitLogEntry[],
+/** Regenerates one group (used for retrying a failed card). */
+export async function generateForGroup(
+    group: PlannedGroup,
+    changes: FileChange[],
+    options: GenerateOptions,
+    token: vscode.CancellationToken,
+    history?: GitLogEntry[],
 ): Promise<CommitCandidate> {
-    const budget = inputBudget(model);
-    const fits = (prompt: string) => fitsPrompt(prompt, model, budget, token, () => checkCancellation(token));
-    let prompt = buildPrompt(group, options, history);
-    if (!await fits(prompt)) {
-        // Check irreducible instructions and file manifest before spending calls
-        // summarizing diffs. These must fit even with no evidence attached.
-        if (!await fits(buildPrompt(group, options, history, ''))) { throw new InputBudgetError(); }
-        const parts = group.files.map(file => ({ path: file.path, type: file.type, offset: 0, text: file.diff }));
-        let evidence = (await summarizeParts(parts, 'diffs', group.label, model, token, budget)).join('\n\n');
-        prompt = buildPrompt(group, options, history, evidence);
-        let rounds = 0;
-        while (!await fits(prompt)) {
-            if (rounds++ >= 3) { throw new InputBudgetError(); }
-            const reduced = (await summarizeParts([{ text: evidence }], 'summaries', group.label, model, token, budget)).join('\n\n');
-            if (reduced.length >= evidence.length) {
-                throw new Error('The model did not shorten its summaries enough. Stage fewer files and generate again.');
-            }
-            evidence = reduced;
-            prompt = buildPrompt(group, options, history, evidence);
-        }
+    const abort = createLinkedToken(token);
+    try {
+        checkCancellation(token);
+        const model = await getModel(options.model);
+        checkCancellation(token);
+        const limiter = createLimiter(clampConcurrency(options.concurrency));
+        const client = createModelClient(model, options, abort.token, limiter, undefined, () => abort.abort());
+        return await generateGroupCandidate({
+            group, changes, options, history, client, token: abort.token,
+        });
+    } finally {
+        abort.dispose();
     }
-    const parsed = parseResponse(await sendPrompt(model, prompt, token));
-    if (!parsed.message.trim() || !parsed.reason.trim()) {
-        throw new Error('The model returned an empty commit message or reason. Generate again.');
-    }
-    return {
-        id: generateId(), message: parsed.message.trim(), reason: parsed.reason.trim(),
-        files: group.files.map(file => file.path), checked: true,
-    };
 }
 
-/** Split requests, never discard input. Even a single oversized file can be analyzed. */
-async function summarizeParts(
-    parts: EvidencePart[], source: 'diffs' | 'summaries', label: string,
-    model: vscode.LanguageModelChat, token: vscode.CancellationToken, budget: number,
-): Promise<string[]> {
-    checkCancellation(token);
-    const prompt = buildSummaryPrompt(label, parts, source);
-    if (await fitsPrompt(prompt, model, budget, token, () => checkCancellation(token))) {
-        const summary = (await sendPrompt(model, prompt, token)).trim();
-        if (!summary) { throw new Error('The model returned an empty diff summary. Generate again.'); }
-        return [summary];
-    }
-    let left: EvidencePart[];
-    let right: EvidencePart[];
-    if (parts.length > 1) {
-        const mid = Math.floor(parts.length / 2);
-        left = parts.slice(0, mid);
-        right = parts.slice(mid);
-    } else {
-        const part = parts[0];
-        if (!part || part.text.length <= 1) { throw new InputBudgetError(); }
-        let mid = Math.floor(part.text.length / 2);
-        // Keep UTF-16 surrogate pairs intact across requests.
-        if (/[\uD800-\uDBFF]/.test(part.text[mid - 1]) && /[\uDC00-\uDFFF]/.test(part.text[mid])) { mid--; }
-        if (mid === 0) { throw new InputBudgetError(); }
-        left = [{ ...part, text: part.text.slice(0, mid) }];
-        right = [{ ...part, offset: (part.offset ?? 0) + mid, text: part.text.slice(mid) }];
-    }
-    const first = await summarizeParts(left, source, label, model, token, budget);
-    const second = await summarizeParts(right, source, label, model, token, budget);
-    return [...first, ...second];
+function clampConcurrency(value: number | undefined): number {
+    const requested = value ?? 4;
+    const safe = Number.isFinite(requested) ? requested : 4;
+    return Math.max(1, Math.min(8, Math.floor(safe)));
+}
+
+function toError(error: unknown): Error {
+    return error instanceof Error ? error : new Error(String(error));
 }
