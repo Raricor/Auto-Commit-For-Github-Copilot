@@ -15,6 +15,14 @@ export function postMessage(msg: import('../types').WebviewMessage): void {
     vscode.postMessage(msg);
 }
 
+export function getState(): unknown {
+    return vscode.getState();
+}
+
+export function setState(state: unknown): void {
+    vscode.setState(state);
+}
+
 export type MessageHandler = (msg: ExtensionMessage) => void;
 
 let handler: MessageHandler | undefined;

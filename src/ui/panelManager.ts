@@ -3,17 +3,27 @@ import { getSettings, updateSettings } from '../config/settings';
 import { parseDiff, resolveStagingPaths } from '../git/diffAnalyzer';
 import { GitIdentityError } from '../git/gitIdentity';
 import { GitService } from '../git/gitService';
-import { generateGroupedCommits, getAvailableModels } from '../llm/llmService';
+import {
+    generateCommits,
+    generateForGroup,
+    getAvailableModels,
+    type RequestEstimate,
+} from '../llm/llmService';
 import type {
     CommitCandidate,
     ExtensionMessage,
     FileChange,
     GenerateOptions,
     GitLogEntry,
+    PlannedGroup,
+    StagedFileInfo,
     WebviewMessage,
 } from '../types';
 
 type ModelInfo = { id: string; name: string };
+
+/** Keep one stagedFiles message small enough for the webview to handle. */
+const MAX_STAGED_DIFF_LENGTH = 1024 * 1024;
 
 export class PanelManager {
     private static instance: PanelManager | undefined;
@@ -30,6 +40,9 @@ export class PanelManager {
     private availableModels: ModelInfo[] | undefined;
     private generationRunId = 0;
     private generating = false;
+    private retrying = false;
+    private generationTree: string | undefined;
+    private lastRun: { groups: PlannedGroup[]; changes: FileChange[] } | undefined;
 
     private constructor(private readonly context: vscode.ExtensionContext) { }
 
@@ -157,6 +170,11 @@ export class PanelManager {
                 break;
             }
 
+            case 'retryGroup': {
+                await this.retryGroup(msg.groupIndex, msg.settings);
+                break;
+            }
+
             case 'commit': {
                 await this.commitSelected(msg.ids, msg.orderedCandidates);
                 break;
@@ -187,6 +205,7 @@ export class PanelManager {
                 this.generationRunId += 1;
                 this.cancellation?.cancel();
                 this.generating = false;
+                this.retrying = false;
                 this.post({ type: 'done' });
                 break;
             }
@@ -256,10 +275,21 @@ export class PanelManager {
             for (const change of changes) {
                 this.fileDiffs.set(change.path, change.diff);
             }
-            this.post({
-                type: 'stagedFiles',
-                files: changes.map((c) => ({ path: c.path, type: c.type, diff: c.diff })),
+            const omitDiffs =
+                changes.reduce((total, change) => total + change.diff.length, 0) >
+                MAX_STAGED_DIFF_LENGTH;
+            const files: StagedFileInfo[] = changes.map((change) => {
+                const { additions, deletions } = countDiffLines(change.diff);
+                return {
+                    path: change.path,
+                    type: change.type,
+                    diff: omitDiffs ? '' : change.diff,
+                    ...(omitDiffs ? { diffOmitted: true } : {}),
+                    additions,
+                    deletions,
+                };
             });
+            this.post({ type: 'stagedFiles', files });
         } catch (err) {
             console.error('[AutoCommit] Failed to load staged files:', err);
             this.post({ type: 'stagedFiles', files: [] });
@@ -269,6 +299,7 @@ export class PanelManager {
     // ─── Generation pipeline ────────────────────────────────────────────────────
 
     private async generate(overrideSettings?: GenerateOptions): Promise<void> {
+        // A new run supersedes any retry that is still in flight.
         this.cancellation?.cancel();
         this.cancellation = new vscode.CancellationTokenSource();
         const token = this.cancellation.token;
@@ -276,7 +307,9 @@ export class PanelManager {
         const isActiveRun = () => runId === this.generationRunId && !token.isCancellationRequested;
 
         this.generating = true;
+        this.retrying = false;
         this.candidates = [];
+        this.lastRun = undefined;
         this.post({ type: 'loading' });
 
         try {
@@ -303,8 +336,12 @@ export class PanelManager {
             }
 
             let diff: string;
+            let generationTree: string;
             try {
                 diff = await gitService.getStagedDiff();
+                // Snapshot the exact index content the model is about to see;
+                // commitSelected only commits this tree, never the working tree.
+                generationTree = await gitService.writeIndexTree();
             } catch (err) {
                 if (isActiveRun()) {
                     this.post({ type: 'error', message: `Failed to read staged diff: ${String(err)}` });
@@ -322,6 +359,7 @@ export class PanelManager {
                 return;
             }
 
+            this.generationTree = generationTree;
             const changes = parseDiff(diff);
             this.fileChanges = changes;
 
@@ -337,19 +375,55 @@ export class PanelManager {
                 return;
             }
 
-            try {
-                await generateGroupedCommits(changes, settings, token, this.recentCommits, candidate => {
-                    if (!isActiveRun()) { return; }
-                    this.candidates.push(candidate);
-                    this.post({ type: 'addCandidate', candidate });
-                });
-            } catch (err) {
-                if (isActiveRun() && !(token.isCancellationRequested || err instanceof vscode.CancellationError)) {
-                    this.post({ type: 'error', message: `Generation failed: ${String(err)}` });
+            const result = await generateCommits(
+                changes,
+                settings,
+                token,
+                this.recentCommits,
+                {
+                    onProgress: (progress) => {
+                        if (!isActiveRun()) { return; }
+                        this.post({ type: 'progress', progress });
+                    },
+                    onGroupsPlanned: (groups) => {
+                        if (!isActiveRun()) { return; }
+                        this.lastRun = { groups, changes };
+                        this.post({ type: 'groupsPlanned', groups });
+                    },
+                    onCandidate: (groupIndex, candidate) => {
+                        if (!isActiveRun()) { return; }
+                        this.candidates.push(candidate);
+                        this.post({ type: 'addCandidate', candidate, groupIndex });
+                    },
+                    onGroupFailed: (group, error) => {
+                        if (!isActiveRun()) { return; }
+                        this.post({ type: 'groupFailed', group, message: error.message });
+                    },
+                    onNotice: (level, message) => {
+                        if (!isActiveRun()) { return; }
+                        this.post({ type: 'notice', level, message });
+                    },
+                    onReorder: (ids) => {
+                        if (!isActiveRun()) { return; }
+                        const byId = new Map(this.candidates.map((candidate) => [candidate.id, candidate]));
+                        this.candidates = ids
+                            .map((id) => byId.get(id))
+                            .filter((candidate): candidate is CommitCandidate => candidate !== undefined);
+                        this.post({ type: 'reorder', ids });
+                    },
+                    confirmRequests: (estimate) => this.confirmRequests(estimate),
                 }
+            );
+
+            if (result.declined && isActiveRun()) {
+                this.post({
+                    type: 'notice',
+                    level: 'info',
+                    message: 'Stopped before sending generation requests.',
+                });
             }
         } catch (err) {
-            if (isActiveRun()) {
+            if (isActiveRun() && !(token.isCancellationRequested || err instanceof vscode.CancellationError)) {
                 this.post({ type: 'error', message: `Generation failed: ${String(err)}` });
             }
         } finally {
@@ -360,24 +434,99 @@ export class PanelManager {
         }
     }
 
+    /** Confirms a run that would send many model requests. */
+    private async confirmRequests(estimate: RequestEstimate): Promise<boolean> {
+        const message = estimate.stage === 'grouping'
+            ? `Grouping ${this.fileChanges.length} files needs about ${estimate.requests} model requests.`
+            : `Generating ${estimate.groups} commits needs about ${estimate.requests} model requests.`;
+        const detail =
+            'Large changes are analyzed in several requests. Each request may count toward your Copilot premium request quota.';
+        const choice = await vscode.window.showWarningMessage(
+            message,
+            { modal: true, detail },
+            'Continue'
+        );
+        return choice === 'Continue';
+    }
+
+    /** Regenerates one failed group from the last planned run. */
+    private async retryGroup(groupIndex: number, overrideSettings?: GenerateOptions): Promise<void> {
+        if (this.generating || this.retrying) { return; }
+
+        const run = this.lastRun;
+        const group = run?.groups.find((planned) => planned.index === groupIndex);
+        if (!run || !group) {
+            this.post({
+                type: 'groupFailed',
+                group: { index: groupIndex, label: '', files: [] },
+                message: 'This group is no longer available. Generate again.',
+            });
+            return;
+        }
+
+        this.retrying = true;
+        const cancellation = new vscode.CancellationTokenSource();
+        this.cancellation = cancellation;
+        const token = cancellation.token;
+
+        try {
+            const requestedSettings = overrideSettings ?? this.effectiveSettings();
+            let settings = await this.normalizeModelSetting(requestedSettings, undefined, true);
+            if ((requestedSettings.model ?? '') !== (settings.model ?? '')) {
+                this.post({ type: 'settings', settings });
+            }
+            if (token.isCancellationRequested) { return; }
+
+            if (settings.language === 'auto') {
+                const repo = await GitService.getRepository(this.targetRepoUri);
+                if (!repo) {
+                    throw new Error(
+                        'No Git repository found. Make sure the workspace contains a git repository.'
+                    );
+                }
+                settings = {
+                    ...settings,
+                    language: await new GitService(repo).detectLanguage(),
+                };
+                if (token.isCancellationRequested) { return; }
+            }
+
+            const candidate = await generateForGroup(
+                group,
+                run.changes,
+                settings,
+                token,
+                this.recentCommits
+            );
+            if (token.isCancellationRequested) { return; }
+
+            this.candidates.push(candidate);
+            this.post({ type: 'addCandidate', candidate, groupIndex: group.index });
+        } catch (err) {
+            if (!token.isCancellationRequested && !(err instanceof vscode.CancellationError)) {
+                this.post({
+                    type: 'groupFailed',
+                    group,
+                    message: err instanceof Error ? err.message : String(err),
+                });
+            }
+        } finally {
+            if (this.cancellation === cancellation) {
+                this.retrying = false;
+            }
+        }
+    }
+
     // ─── Commit execution ───────────────────────────────────────────────────────
 
     private async commitSelected(ids: string[], orderedCandidates?: CommitCandidate[]): Promise<void> {
-        if (this.generating) { return; }
+        if (this.generating || this.retrying) { return; }
         // Use ordered candidates from webview if provided (user may have reordered/edited)
         const allCandidates = orderedCandidates ?? this.candidates;
         const selected = allCandidates.filter((c) => ids.includes(c.id));
         if (selected.length === 0) {
             return;
         }
-
-        const committedIds = selected.map((c) => c.id);
-        const selectedPaths = new Set(selected.flatMap(candidate => candidate.files));
-        const uncheckedFiles = resolveStagingPaths(
-            // After cancellation/failure some staged files may not have a candidate yet.
-            this.fileChanges.filter(file => !selectedPaths.has(file.path)).map(file => file.path),
-            this.fileChanges
-        );
 
         const repo = await GitService.getRepository(this.targetRepoUri);
         if (!repo) {
@@ -390,23 +539,40 @@ export class PanelManager {
 
         try {
             await gitService.assertCommitIdentityConfigured();
-            await gitService.unstageAll();
-
-            for (const candidate of selected) {
-                const stagingPaths = resolveStagingPaths(candidate.files, this.fileChanges);
-                await gitService.stageAndCommit(stagingPaths, candidate.message);
+            const currentTree = await gitService.writeIndexTree();
+            if (!this.generationTree || currentTree !== this.generationTree) {
+                this.post({
+                    type: 'error',
+                    message: 'The staged changes have changed since generation. Generate again before committing.',
+                });
+                return;
             }
 
-            if (uncheckedFiles.length > 0) {
-                await gitService.restoreStaged(uncheckedFiles);
-            }
-
-            this.candidates = allCandidates.filter((c) => !committedIds.includes(c.id));
-            this.post({ type: 'committed', count: selected.length, ids: committedIds });
-
-            void vscode.window.showInformationMessage(
-                `AutoCommit: ${selected.length} commit${selected.length > 1 ? 's' : ''} created.`
+            const commits = selected.map((candidate) => ({
+                id: candidate.id,
+                paths: resolveStagingPaths(candidate.files, this.fileChanges),
+                message: candidate.message,
+            }));
+            const { committedIds, error } = await gitService.commitFromSnapshot(
+                currentTree,
+                commits
             );
+
+            if (committedIds.length > 0) {
+                this.post({ type: 'committed', count: committedIds.length, ids: committedIds });
+                this.candidates = this.candidates.filter((c) => !committedIds.includes(c.id));
+            }
+
+            if (error) {
+                this.post({
+                    type: 'error',
+                    message: `Commit failed after ${committedIds.length} commit(s): ${error.message}`,
+                });
+            } else {
+                void vscode.window.showInformationMessage(
+                    `AutoCommit: ${committedIds.length} commit${committedIds.length > 1 ? 's' : ''} created.`
+                );
+            }
 
             // Refresh staged-files panel and commit history after committing
             await this.loadStagedFiles();
@@ -485,6 +651,24 @@ export class PanelManager {
 
 // ─── Webview HTML ─────────────────────────────────────────────────────────────
 
+function countDiffLines(diff: string): { additions: number; deletions: number } {
+    let additions = 0;
+    let deletions = 0;
+    // Only lines before the first hunk can be +++/--- headers; after it a
+    // deleted "-- comment" line is a real change.
+    let inHunk = false;
+    for (const line of diff.split('\n')) {
+        if (line.startsWith('@@')) { inHunk = true; }
+        if (!inHunk) { continue; }
+        if (line.startsWith('+')) {
+            additions += 1;
+        } else if (line.startsWith('-')) {
+            deletions += 1;
+        }
+    }
+    return { additions, deletions };
+}
+
 function buildWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri): string {
     const nonce = getNonce();
     const scriptUri = webview.asWebviewUri(
@@ -500,7 +684,7 @@ function buildWebviewHtml(webview: vscode.Webview, extensionUri: vscode.Uri): st
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}';">
+    content="default-src 'none'; style-src ${webview.cspSource} 'unsafe-inline'; script-src 'nonce-${nonce}'; font-src ${webview.cspSource};">
   <title>AutoCommit For Github Copilot</title>
   <link rel="stylesheet" href="${styleUri}">
 </head>

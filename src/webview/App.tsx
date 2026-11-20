@@ -1,117 +1,34 @@
 import { Check, ChevronDown, ChevronRight, GitCommit, RotateCw, Sparkles, Square } from 'lucide-react';
-import { useCallback, useEffect, useReducer, useState } from 'react';
-import type { CommitCandidate, GenerateOptions, GitLogEntry } from '../types';
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+import type { GenerateOptions } from '../types';
 import CandidatesList from './components/CandidatesList';
 import CommitHistory from './components/CommitHistory';
 import FileChanges from './components/FileChanges';
+import GenerationProgress from './components/GenerationProgress';
+import Notices from './components/Notices';
 import SettingsPanel from './components/SettingsPanel';
+import {
+    canSubmit,
+    checkedCount,
+    commitPayload,
+    hasRetryingSlots,
+    initialState,
+    isCommitBusy,
+    orderedCandidates,
+    reducer,
+    slotKey,
+} from './state';
+import type { Slot } from './state';
+import { useFlip } from './useFlip';
 import { onMessage, postMessage } from './vscodeApi';
-
-interface StagedFile {
-    path: string;
-    type: string;
-    diff: string;
-}
-
-interface AppState {
-    generating: boolean;
-    committing: boolean;
-    candidates: CommitCandidate[];
-    stagedFiles: StagedFile[];
-    stagedLoading: boolean;
-    error: string | null;
-    success: string | null;
-    models: Array<{ id: string; name: string }>;
-    settings: GenerateOptions;
-    prompt: string;
-    commitHistory: GitLogEntry[];
-}
-
-type Action =
-    | { type: 'SET_LOADING' }
-    | { type: 'SET_COMMITTING'; committing: boolean }
-    | { type: 'ADD_CANDIDATE'; candidate: CommitCandidate }
-    | { type: 'DONE' }
-    | { type: 'ERROR'; message: string }
-    | { type: 'COMMITTED'; count: number; ids: string[] }
-    | { type: 'SET_SETTINGS'; settings: GenerateOptions }
-    | { type: 'SET_MODELS'; models: Array<{ id: string; name: string }> }
-    | { type: 'SET_STAGED_FILES'; files: StagedFile[] }
-    | { type: 'TOGGLE_CANDIDATE'; id: string }
-    | { type: 'SET_PROMPT'; prompt: string }
-    | { type: 'UPDATE_SETTING'; key: string; value: unknown }
-    | { type: 'SET_COMMIT_HISTORY'; commits: GitLogEntry[] }
-    | { type: 'REORDER_CANDIDATES'; candidates: CommitCandidate[] }
-    | { type: 'UPDATE_CANDIDATE_MESSAGE'; id: string; message: string };
-
-const initialState: AppState = {
-    generating: false,
-    committing: false,
-    candidates: [],
-    stagedFiles: [],
-    stagedLoading: true,
-    error: null,
-    success: null,
-    models: [],
-    settings: { conventionalCommits: true, language: 'en' },
-    prompt: '',
-    commitHistory: [],
-};
-
-function reducer(state: AppState, action: Action): AppState {
-    switch (action.type) {
-        case 'SET_LOADING':
-            return { ...state, generating: true, candidates: [], error: null, success: null };
-        case 'SET_COMMITTING':
-            return { ...state, committing: action.committing, error: null, success: null };
-        case 'ADD_CANDIDATE':
-            return { ...state, candidates: [...state.candidates, action.candidate] };
-        case 'DONE':
-            return { ...state, generating: false };
-        case 'ERROR':
-            return { ...state, generating: false, committing: false, error: action.message };
-        case 'COMMITTED':
-            return {
-                ...state,
-                committing: false,
-                candidates: state.candidates.filter((c) => !action.ids.includes(c.id)),
-                success: `${action.count} commit${action.count > 1 ? 's' : ''} created successfully.`,
-            };
-        case 'SET_SETTINGS':
-            return { ...state, settings: action.settings };
-        case 'SET_MODELS':
-            return { ...state, models: action.models };
-        case 'SET_STAGED_FILES':
-            return { ...state, stagedFiles: action.files, stagedLoading: false };
-        case 'TOGGLE_CANDIDATE':
-            return {
-                ...state,
-                candidates: state.candidates.map((c) =>
-                    c.id === action.id ? { ...c, checked: !c.checked } : c
-                ),
-            };
-        case 'SET_PROMPT':
-            return { ...state, prompt: action.prompt };
-        case 'UPDATE_SETTING':
-            return { ...state, settings: { ...state.settings, [action.key]: action.value } };
-        case 'SET_COMMIT_HISTORY':
-            return { ...state, commitHistory: action.commits };
-        case 'REORDER_CANDIDATES':
-            return { ...state, candidates: action.candidates };
-        case 'UPDATE_CANDIDATE_MESSAGE':
-            return {
-                ...state,
-                candidates: state.candidates.map((c) =>
-                    c.id === action.id ? { ...c, message: action.message } : c
-                ),
-            };
-        default:
-            return state;
-    }
-}
 
 export default function App() {
     const [state, dispatch] = useReducer(reducer, initialState);
+    const listRef = useRef<HTMLDivElement | null>(null);
+
+    const displaySlots = useMemo(() => [...state.slots].reverse(), [state.slots]);
+    const displayKeys = useMemo(() => displaySlots.map(slotKey), [displaySlots]);
+    const { capture } = useFlip(displayKeys, listRef);
 
     useEffect(() => {
         const cleanup = onMessage((msg) => {
@@ -119,8 +36,25 @@ export default function App() {
                 case 'loading':
                     dispatch({ type: 'SET_LOADING' });
                     break;
+                case 'progress':
+                    dispatch({ type: 'PROGRESS', progress: msg.progress });
+                    break;
+                case 'groupsPlanned':
+                    dispatch({ type: 'GROUPS_PLANNED', groups: msg.groups });
+                    break;
                 case 'addCandidate':
-                    dispatch({ type: 'ADD_CANDIDATE', candidate: msg.candidate });
+                    dispatch({ type: 'ADD_CANDIDATE', candidate: msg.candidate, groupIndex: msg.groupIndex });
+                    break;
+                case 'groupFailed':
+                    dispatch({ type: 'GROUP_FAILED', group: msg.group, message: msg.message });
+                    break;
+                case 'reorder':
+                    // Measure the old order before React applies the new one.
+                    capture();
+                    dispatch({ type: 'AI_REORDER', ids: msg.ids });
+                    break;
+                case 'notice':
+                    dispatch({ type: 'NOTICE', level: msg.level, message: msg.message });
                     break;
                 case 'done':
                     dispatch({ type: 'DONE' });
@@ -143,12 +77,22 @@ export default function App() {
                 case 'commitHistory':
                     dispatch({ type: 'SET_COMMIT_HISTORY', commits: msg.commits });
                     break;
+                case 'diffContent':
+                    dispatch({ type: 'SET_DIFF_CONTENT', path: msg.path, content: msg.content });
+                    break;
             }
         });
 
         postMessage({ type: 'ready' });
         return cleanup;
-    }, []);
+    }, [capture]);
+
+    const badgeToken = state.reorderBadges?.token;
+    useEffect(() => {
+        if (badgeToken === undefined) return;
+        const timer = window.setTimeout(() => dispatch({ type: 'CLEAR_REORDER_BADGES' }), 2500);
+        return () => window.clearTimeout(timer);
+    }, [badgeToken]);
 
     const handleGenerate = useCallback(() => {
         if (state.committing) {
@@ -165,26 +109,48 @@ export default function App() {
     }, [state.settings, state.prompt, state.committing]);
 
     const handleCommit = useCallback(() => {
-        if (state.committing || state.generating) {
+        if (!canSubmit(state)) {
             return;
         }
-        const ids = state.candidates.filter((c) => c.checked).map((c) => c.id);
+        const { ids, orderedCandidates: ordered } = commitPayload(state);
         if (ids.length > 0) {
             dispatch({ type: 'SET_COMMITTING', committing: true });
-            postMessage({ type: 'commit', ids, orderedCandidates: state.candidates });
+            postMessage({ type: 'commit', ids, orderedCandidates: ordered });
         }
-    }, [state.candidates, state.committing, state.generating]);
+    }, [state]);
 
     const handleCommitOne = useCallback((id: string) => {
-        if (state.committing || state.generating || !state.candidates.some((c) => c.id === id)) {
+        if (isCommitBusy(state)) {
+            return;
+        }
+        const slot = state.slots.find((s) => s.status === 'ready' && s.candidate?.id === id);
+        if (!slot) {
             return;
         }
         dispatch({ type: 'SET_COMMITTING', committing: true });
-        postMessage({ type: 'commit', ids: [id], orderedCandidates: state.candidates });
-    }, [state.candidates, state.committing, state.generating]);
+        postMessage({ type: 'commit', ids: [id], orderedCandidates: orderedCandidates(state) });
+    }, [state]);
+
+    const handleRetryGroup = useCallback((groupIndex: number) => {
+        dispatch({ type: 'RETRY_GROUP', groupIndex });
+        postMessage({
+            type: 'retryGroup',
+            groupIndex,
+            settings: { ...state.settings, prompt: state.prompt },
+        });
+    }, [state.settings, state.prompt]);
+
+    const handleUndoReorder = useCallback(() => {
+        capture();
+        dispatch({ type: 'UNDO_REORDER' });
+    }, [capture]);
 
     const handleOpenFile = useCallback((path: string) => {
         postMessage({ type: 'openFile', path });
+    }, []);
+
+    const handleShowDiff = useCallback((path: string) => {
+        postMessage({ type: 'showDiff', path });
     }, []);
 
     const handleToggleCandidate = useCallback((id: string) => {
@@ -203,12 +169,16 @@ export default function App() {
         dispatch({ type: 'SET_PROMPT', prompt });
     }, []);
 
-    const handleReorderCandidates = useCallback((candidates: CommitCandidate[]) => {
-        dispatch({ type: 'REORDER_CANDIDATES', candidates });
+    const handleReorderSlots = useCallback((slots: Slot[]) => {
+        dispatch({ type: 'REORDER_SLOTS', slots });
     }, []);
 
     const handleUpdateMessage = useCallback((id: string, message: string) => {
         dispatch({ type: 'UPDATE_CANDIDATE_MESSAGE', id, message });
+    }, []);
+
+    const handleDismissNotice = useCallback((id: number) => {
+        dispatch({ type: 'DISMISS_NOTICE', id });
     }, []);
 
     const handleStop = useCallback(() => {
@@ -220,9 +190,12 @@ export default function App() {
     }, []);
 
     const [commitsExpanded, setCommitsExpanded] = useState(true);
-    const checkedCount = state.candidates.filter((c) => c.checked).length;
+    const checked = checkedCount(state);
     const hasStaged = state.stagedFiles.length > 0;
-    const showCandidates = state.candidates.length > 0;
+    const showCandidates = state.slots.length > 0;
+    const ordering = state.generating && state.progress?.stage === 'ordering';
+    const commitBusy = isCommitBusy(state);
+    const retrying = hasRetryingSlots(state);
 
     return (
         <div className="app">
@@ -271,16 +244,14 @@ export default function App() {
                         </div>
                     )}
 
+                    {/* Informational and warning notices */}
+                    <Notices notices={state.notices} onDismiss={handleDismissNotice} />
+
                     {/* Success */}
                     {state.success && <div className="success-banner">{state.success}</div>}
 
-                    {/* Generating spinner */}
-                    {state.generating && (
-                        <div className="loading-wrap">
-                            <div className="spinner" />
-                            <span>Grouping changes and generating commits...</span>
-                        </div>
-                    )}
+                    {/* Generation progress */}
+                    {state.generating && <GenerationProgress progress={state.progress} />}
 
                     {/* Generated Commits */}
                     {showCandidates && (
@@ -292,7 +263,13 @@ export default function App() {
                                 <div className="panel-toggle-left">
                                     <GitCommit size={16} />
                                     <span>Generated Commits</span>
-                                    <span className="panel-toggle-count">({state.candidates.length})</span>
+                                    <span className="panel-toggle-count">({state.slots.length})</span>
+                                    {ordering && (
+                                        <span className="ordering-indicator">
+                                            <span className="spinner spinner-xs" />
+                                            <span>Ordering…</span>
+                                        </span>
+                                    )}
                                 </div>
                                 <div className="panel-toggle-right">
                                     {commitsExpanded ? <ChevronDown size={16} /> : <ChevronRight size={16} />}
@@ -302,28 +279,38 @@ export default function App() {
                             {commitsExpanded && (
                                 <div className="panel-body commits-body">
                                     <div className="section-divider">
-                                        Pending ({state.candidates.length})
+                                        Pending ({state.slots.length})
                                     </div>
                                     <CandidatesList
-                                        candidates={state.candidates}
+                                        slots={state.slots}
+                                        moves={state.reorderBadges?.moves ?? {}}
+                                        showAiReorder={state.aiReorder !== null}
+                                        onUndoReorder={handleUndoReorder}
                                         onToggle={handleToggleCandidate}
                                         onOpenFile={handleOpenFile}
-                                        onReorder={handleReorderCandidates}
+                                        onReorder={handleReorderSlots}
                                         onUpdateMessage={handleUpdateMessage}
                                         onCommitOne={handleCommitOne}
-                                        commitDisabled={state.committing || state.generating}
+                                        onRetryGroup={handleRetryGroup}
+                                        commitDisabled={commitBusy}
+                                        listRef={listRef}
                                     />
                                     <button
                                         className="btn-commit-all"
-                                        disabled={checkedCount === 0 || state.committing || state.generating}
+                                        disabled={!canSubmit(state)}
                                         onClick={handleCommit}
                                     >
                                         <Check size={16} />
-                                        Commit Selected ({checkedCount})
+                                        Commit Selected ({checked})
                                     </button>
                                 </div>
                             )}
                         </div>
+                    )}
+
+                    {/* Retry-in-progress hint while commits are blocked */}
+                    {retrying && !state.generating && (
+                        <div className="retrying-hint">Waiting for the failed group to finish retrying…</div>
                     )}
 
                     {/* Commit History */}
@@ -334,7 +321,13 @@ export default function App() {
 
                 {/* Right Panel - File Changes */}
                 <div className="right-panel">
-                    <FileChanges files={state.stagedFiles} loading={state.stagedLoading} onRefresh={handleRefresh} />
+                    <FileChanges
+                        files={state.stagedFiles}
+                        loading={state.stagedLoading}
+                        onRefresh={handleRefresh}
+                        diffCache={state.diffCache}
+                        onShowDiff={handleShowDiff}
+                    />
                 </div>
             </div>
         </div>
