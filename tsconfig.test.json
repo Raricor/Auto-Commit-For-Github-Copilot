@@ -8,6 +8,7 @@
         "src/types.ts",
         "src/git/diffAnalyzer.ts",
         "src/git/gitIdentity.ts",
+        "src/git/gitService.ts",
         "src/llm/**/*.ts",
         "src/ui/panelManager.ts",
         "tests/**/*.ts"

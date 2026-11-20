@@ -10,34 +10,40 @@ export function parseDiff(rawDiff: string): FileChange[] {
     const segments = rawDiff.split(/^(?=diff --git )/m).filter(Boolean);
 
     for (const segment of segments) {
-        // Match either "diff --git a/PATH b/PATH" or "diff --git \"a/PATH\" \"b/PATH\""
-        // (git uses the quoted form when paths contain non-ASCII bytes and
-        // core.quotePath=true). Capture group 1 = unquoted b-path,
-        // group 2 = quoted b-path with octal-escaped bytes.
-        const headerMatch = segment.match(
-            /^diff --git (?:a\/.+? b\/(.+)|"a\/(?:[^"\\]|\\.)+" "b\/((?:[^"\\]|\\.)+)")\n/
-        );
-        if (!headerMatch) {
+        const headerEnd = segment.indexOf('\n');
+        const header = (headerEnd === -1 ? segment : segment.slice(0, headerEnd)).replace(/\r$/, '');
+        if (!header.startsWith('diff --git ')) {
             continue;
         }
 
-        let filePath = headerMatch[1]
-            ? headerMatch[1].trimEnd()
-            : unescapeGitQuotedPath(headerMatch[2]);
+        let filePath: string | undefined;
         let type: FileChange['type'] = 'modified';
         let originalPath: string | undefined;
 
-        if (/^new file mode/m.test(segment)) {
-            type = 'added';
-        } else if (/^deleted file mode/m.test(segment)) {
-            type = 'deleted';
-        } else if (/^rename /m.test(segment)) {
+        const renameFrom = segment.match(/^rename from (.+)$/m);
+        const renameTo = segment.match(/^rename to (.+)$/m);
+        const copyFrom = segment.match(/^copy from (.+)$/m);
+        const copyTo = segment.match(/^copy to (.+)$/m);
+
+        if (renameFrom && renameTo) {
+            // A rename header has two different paths, so read both from the
+            // dedicated lines instead of trying to split the header.
             type = 'renamed';
-            const renameFrom = segment.match(/^rename from (.+)$/m);
-            const renameTo = segment.match(/^rename to (.+)$/m);
-            if (renameFrom && renameTo) {
-                originalPath = decodeDiffPath(renameFrom[1]);
-                filePath = decodeDiffPath(renameTo[1]);
+            originalPath = decodeDiffPath(renameFrom[1]);
+            filePath = decodeDiffPath(renameTo[1]);
+        } else if (copyFrom && copyTo) {
+            // Copies behave like additions: only the destination path is staged.
+            type = 'added';
+            filePath = decodeDiffPath(copyTo[1]);
+        } else {
+            filePath = parseHeaderPath(header);
+            if (filePath === undefined) {
+                continue;
+            }
+            if (/^new file mode/m.test(segment)) {
+                type = 'added';
+            } else if (/^deleted file mode/m.test(segment)) {
+                type = 'deleted';
             }
         }
 
@@ -45,6 +51,37 @@ export function parseDiff(rawDiff: string): FileChange[] {
     }
 
     return results;
+}
+
+/**
+ * Extracts the path from a `diff --git` header. For non-rename/non-copy
+ * entries both sides are identical, so the unquoted form can be split by
+ * length instead of searching for the ` b/` separator (a path may itself
+ * contain that sequence).
+ */
+function parseHeaderPath(header: string): string | undefined {
+    const unquotedPrefix = 'diff --git a/';
+    if (header.startsWith(unquotedPrefix)) {
+        const remainder = header.slice(unquotedPrefix.length);
+        const separatorLength = 3; // " b/"
+        const pathLength = (remainder.length - separatorLength) / 2;
+        if (!Number.isInteger(pathLength) || pathLength <= 0) {
+            return undefined;
+        }
+        const aPath = remainder.slice(0, pathLength);
+        const bPath = remainder.slice(pathLength + separatorLength);
+        return aPath === bPath ? aPath : undefined;
+    }
+
+    // Git quotes a path when it contains quotes/control characters; with
+    // core.quotePath=false non-ASCII bytes stay literal inside those quotes.
+    const quoted = header.match(/^diff --git "a\/((?:[^"\\]|\\.)+)" "b\/((?:[^"\\]|\\.)+)"$/);
+    if (!quoted) {
+        return undefined;
+    }
+    const aPath = unescapeGitQuotedPath(quoted[1]);
+    const bPath = unescapeGitQuotedPath(quoted[2]);
+    return aPath === bPath ? bPath : undefined;
 }
 
 /** Expands renamed files to both pathspecs needed to stage the complete rename. */
@@ -88,8 +125,17 @@ function unescapeGitQuotedPath(s: string): string {
             bytes.push(cEscapes[s[i + 1]]);
             i += 1;
         } else {
-            // Plain ASCII char in the quoted path
-            bytes.push(ch.charCodeAt(0) & 0xff);
+            // core.quotePath=false leaves non-ASCII characters literal even
+            // when the path is quoted for another reason (e.g. a double quote).
+            const codePoint = s.codePointAt(i)!;
+            if (codePoint < 0x80) {
+                bytes.push(codePoint);
+            } else {
+                bytes.push(...new TextEncoder().encode(String.fromCodePoint(codePoint)));
+                if (codePoint > 0xffff) {
+                    i += 1;
+                }
+            }
         }
     }
     return new TextDecoder('utf-8').decode(Uint8Array.from(bytes));

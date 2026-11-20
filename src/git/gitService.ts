@@ -104,10 +104,11 @@ export class GitService {
         return pick?.repo;
     }
 
-    /** Returns the full staged diff text. Forces `core.quotePath=false` so non-ASCII paths are not octal-escaped. */
+    /** Returns the full staged diff text. Forces stable prefixes and `core.quotePath=false` so parsing does not depend on user diff config. */
     async getStagedDiff(): Promise<string> {
         const { stdout } = await this.git([
-            'diff', '--cached', '--no-color',
+            'diff', '--cached', '--no-color', '--no-ext-diff',
+            '--src-prefix=a/', '--dst-prefix=b/',
         ]);
         return stdout;
     }
@@ -158,15 +159,6 @@ export class GitService {
         }
     }
 
-    /**
-     * Stages exactly `files`, then commits with `message`.
-     * Caller is responsible for having called unstageAll() first.
-     */
-    async stageAndCommit(files: string[], message: string): Promise<void> {
-        await this.git(['add', '--', ...files]);
-        await this.git(['commit', '-m', message]);
-    }
-
     /** Rejects before index mutation when Git's configured author identity is incomplete. */
     async assertCommitIdentityConfigured(): Promise<void> {
         const [name, email] = await Promise.all([
@@ -185,17 +177,55 @@ export class GitService {
         }
     }
 
-    /** Unstages all currently staged files. Handles the empty-repo (no HEAD) case. */
-    async unstageAll(): Promise<void> {
+    /** `git write-tree`. Fails when the index has unresolved conflicts. */
+    async writeIndexTree(): Promise<string> {
+        const { stdout } = await this.git(['write-tree']);
+        return stdout.trim();
+    }
+
+    /**
+     * Commits each entry with exactly the staged content recorded in `snapshotTree`,
+     * never the working tree. Afterwards the index again equals `snapshotTree`,
+     * so whatever was not committed stays staged exactly as before.
+     * Stops at the first failure; earlier commits stay.
+     */
+    async commitFromSnapshot(
+        snapshotTree: string,
+        commits: Array<{ id: string; paths: string[]; message: string }>,
+    ): Promise<{ committedIds: string[]; error?: Error }> {
         if (await this.hasHead()) {
-            await this.git(['restore', '--staged', '.']);
+            await this.git(['read-tree', 'HEAD']);
         } else {
-            // Empty repository: HEAD does not yet exist, so `git restore --staged`
-            // would fail with `fatal: could not resolve HEAD`. Clear the index
-            // directly with `rm --cached` instead — this only touches the index,
-            // not the working tree.
-            await this.git(['rm', '-r', '--cached', '--ignore-unmatch', '--', '.']);
+            await this.git(['read-tree', '--empty']);
         }
+
+        const committedIds: string[] = [];
+        let error: Error | undefined;
+        try {
+            for (const commit of commits) {
+                try {
+                    await this.git([
+                        'restore', `--source=${snapshotTree}`, '--staged', '--', ...commit.paths,
+                    ]);
+                    await this.git(['commit', '-m', commit.message]);
+                    committedIds.push(commit.id);
+                } catch (err) {
+                    error = err instanceof Error ? err : new Error(String(err));
+                    break;
+                }
+            }
+        } finally {
+            // Restore the full original snapshot even when a hook aborted a
+            // commit, so the user's staged state is never lost.
+            await this.git(['read-tree', snapshotTree]);
+            try {
+                await this.git(['update-index', '-q', '--refresh']);
+            } catch {
+                // A stale stat cache is harmless; the index content is correct.
+            }
+        }
+
+        return error ? { committedIds, error } : { committedIds };
     }
 
     private async hasHead(): Promise<boolean> {
@@ -226,14 +256,6 @@ export class GitService {
         } catch {
             return [];
         }
-    }
-
-    /** Re-stages the given files (used to restore unchecked candidates). */
-    async restoreStaged(files: string[]): Promise<void> {
-        if (files.length === 0) {
-            return;
-        }
-        await this.git(['add', '--', ...files]);
     }
 
     private async git(args: string[]): Promise<{ stdout: string; stderr: string }> {
